@@ -50,6 +50,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import asdict, dataclass, field
@@ -59,6 +60,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from .config import RunConfig
 from .data import pad_for_seq_len, write_count
 from .gate import (
+    BASE_CONFIG,
     LARGEST_D,
     LARGEST_M,
     N_QUERIES,
@@ -289,6 +291,8 @@ class Grid:
     control_m: int = 16
     #: Панель softmax-контроля: ветвь без предела ёмкости, вдоль всей оси.
     softmax_ms: Tuple[int, ...] = (SMALLEST_M, LARGEST_M)
+    #: Нормализованное имя студента для сетки :func:`student_grid`; у именованных сеток пусто.
+    student: str = ""
 
     def n_runs(self) -> int:
         """Общее число запусков в худшем случае, для публикуемого бюджета ``запусков x на-запуск``."""
@@ -386,6 +390,111 @@ REDUCED_GRID = Grid(
 )
 
 GRIDS = {g.name: g for g in (FULL_GRID, REDUCED_GRID)}
+
+
+# ---------------------------------------------------------------------------
+# Сетка студента
+# ---------------------------------------------------------------------------
+
+#: Правила, которые разыгрываются между студентами.  ``gated`` в жребии нет: его
+#: точность по ``M`` немонотонна, и студенту, которому он выпал бы, досталась бы
+#: наименее пригодная для аппроксимации кривая в группе.
+STUDENT_ARMS = ("linear", "delta")
+
+#: Seed студентов лежат в ``[STUDENT_SEED_MIN, STUDENT_SEED_MIN + STUDENT_SEED_SPAN)``
+#: и не совпадают с seed эталонных сеток (0, 1, 2): эталон публикуется после
+#: сдачи части 1, и студент не должен повторять его запуски.
+STUDENT_SEED_MIN = 1000
+STUDENT_SEED_SPAN = 1_000_000
+
+
+@dataclass(frozen=True)
+class StudentAssignment:
+    """Что прогоняет один студент: одно правило обновления и два собственных seed."""
+
+    student: str
+    arm: str
+    seeds: Tuple[int, int]
+
+
+def assign_student(student: str) -> StudentAssignment:
+    """Правило и seed студента, выведенные из хеша имени.
+
+    Имя нормализуется — регистр и пробелы не важны, — так что выбрать удобное
+    правило нельзя, а преподаватель восстанавливает назначение по тому же имени.
+    """
+    key = " ".join(student.split()).lower()
+    if not key:
+        raise ValueError("имя студента пустое")
+    h = hashlib.sha256(f"linattn-homework:{key}".encode("utf-8")).digest()
+    arm = STUDENT_ARMS[h[0] % len(STUDENT_ARMS)]
+    first = int.from_bytes(h[1:9], "big") % STUDENT_SEED_SPAN
+    # Второй seed выбирается из оставшихся SPAN - 1 значений, поэтому всегда отличен от первого.
+    second = int.from_bytes(h[9:17], "big") % (STUDENT_SEED_SPAN - 1)
+    if second >= first:
+        second += 1
+    return StudentAssignment(key, arm, (STUDENT_SEED_MIN + first, STUDENT_SEED_MIN + second))
+
+
+def student_grid(student: str) -> Grid:
+    """Панель ёмкости сетки ``reduced`` для одного правила и двух seed студента.
+
+    Тест на число записей и отрицательные контроли сюда не входят: их считает
+    :func:`run_extension`, и только для того расширения, которое выбрал студент.
+    """
+    a = assign_student(student)
+    g = REDUCED_GRID
+    return Grid(
+        name="student",
+        capacity_arms=(a.arm,),
+        d_ks=g.d_ks,
+        seeds=a.seeds,
+        resolution=g.resolution,
+        n_probes=g.n_probes,
+        control_d_k=g.control_d_k,
+        softmax_ms=g.softmax_ms,
+        student=a.student,
+    )
+
+
+#: Расширения части 3, для которых нужны собственные запуски.
+EXTENSIONS = ("a", "b", "c", "d")
+
+#: Расширение (c): две головы с равными байтами состояния, ``d_k · d_v = 512``.
+#: Точка ``(8, 64)`` совпадает с панелью ёмкости и берётся из кэша.
+EQUAL_BYTES_HEADS = ((16, 32), (8, 64))
+
+#: Расширение (d): ``d_k`` гибрида — наименьшее на оси, где ёмкости меньше всего
+#: и эффект второго слоя виден лучше всего.
+HYBRID_D_K = 8
+
+
+def _control_on_capacity_panel(grid: Grid) -> bool:
+    """Совпадает ли точка отрицательных контролей с пробной точкой панели ёмкости."""
+    probes = probe_points(SMALLEST_M, LARGEST_M, grid.n_probes)
+    return grid.control_d_k in grid.d_ks and grid.control_m in probes
+
+
+def extension_new_runs(which: str, assignment: StudentAssignment) -> int:
+    """Запусков сверх собственной сетки студента, в худшем случае.
+
+    Запуск с тем же ключом, что у запуска сетки студента, берётся из кэша и не
+    стоит ничего.
+    """
+    g = REDUCED_GRID
+    per_point = bisection_runs(0, g.resolution, g.n_probes)
+    if which == "a":
+        cached = 0
+        if _control_on_capacity_panel(g):
+            cached = (BASE_CONFIG.chunk_size in g.chunk_sizes) + (SWEEP_SEQ_LEN in g.pad_seq_lens)
+        return len(g.chunk_sizes) + len(g.pad_seq_lens) - cached
+    if which == "b":
+        n = sum(bisection_runs(d, g.resolution, g.n_probes) for d in g.distractors if d)
+        own_zero = assignment.arm == g.distractor_arm and g.distractor_d_k in g.d_ks
+        return n + (0 if own_zero else per_point)
+    if which in ("c", "d"):
+        return len(assignment.seeds) * per_point
+    raise ValueError(f"неизвестное расширение {which!r}; ожидается одно из {EXTENSIONS}")
 
 
 # ---------------------------------------------------------------------------
@@ -509,3 +618,83 @@ def run_grid(
         path.write_text(json.dumps(summary, indent=2, sort_keys=True))
         summary["path"] = str(path)
     return summary
+
+
+def run_extension(
+    which: str,
+    student: str,
+    device: str = "auto",
+    out_dir="results/runs",
+    summary_dir="results",
+    progress: bool = True,
+    skip_gate: bool = False,
+) -> dict:
+    """Запуски одного расширения части 3 на правиле и seed студента.
+
+    * ``a`` — отрицательные контроли: размер чанка и длина последовательности за
+      счёт паддинга, на правиле студента и его первом seed;
+    * ``b`` — тест на число записей, всегда на ``linear``: сдвиг ``-D/2`` выведен
+      для линейного правила;
+    * ``c`` — две головы с равными байтами состояния, :data:`EQUAL_BYTES_HEADS`;
+    * ``d`` — гибрид: второй слой softmax, первый — правило студента, и та же
+      точка без гибрида для сравнения.
+
+    Кэш запусков общий с :func:`run_grid`, так что запуски, которые уже сделала
+    сетка студента, не повторяются.  Сводка записывается в
+    ``extension_<which>.json`` рядом со сводкой сетки.
+    """
+    if which not in EXTENSIONS:
+        raise ValueError(f"неизвестное расширение {which!r}; ожидается одно из {EXTENSIONS}")
+    if not skip_gate:
+        require_gate(device=device, out_dir=str(Path(summary_dir) / "gate"), progress=progress)
+
+    a = assign_student(student)
+    g = REDUCED_GRID
+    first_seed = a.seeds[0]
+
+    def point(arm: str, d_k: int, seed: int, n_distractors: int = 0, **overrides) -> dict:
+        return collapse_point(
+            arm, d_k, seed=seed, n_distractors=n_distractors, resolution=g.resolution,
+            n_probes=g.n_probes, device=device, out_dir=out_dir, progress=progress,
+            **overrides,
+        ).to_dict()
+
+    started = time.perf_counter()
+    out: dict = {"extension": which, "student": asdict(a)}
+    if which == "a":
+        out["chunk_size_control"] = [
+            _single(
+                _point_config(a.arm, g.control_d_k, g.control_m, 0, first_seed, chunk_size=chunk),
+                device, out_dir, progress, f"chunk_size={chunk}",
+            )
+            for chunk in g.chunk_sizes
+        ]
+        base = _point_config(a.arm, g.control_d_k, g.control_m, 0, first_seed, n_pad=0)
+        out["padding_control"] = []
+        for seq_len in g.pad_seq_lens:
+            cfg = base.replace(n_pad=pad_for_seq_len(base, seq_len))
+            out["padding_control"].append(
+                _single(cfg, device, out_dir, progress, f"seq_len={seq_len} (P={cfg.n_pad})")
+            )
+    elif which == "b":
+        out["write_count_test"] = [
+            point(g.distractor_arm, g.distractor_d_k, first_seed, n_distractors=d)
+            for d in g.distractors
+        ]
+    elif which == "c":
+        out["equal_state_bytes"] = [
+            point(a.arm, d_k, seed, d_v=d_v) for d_k, d_v in EQUAL_BYTES_HEADS for seed in a.seeds
+        ]
+    else:
+        out["pure"] = [point(a.arm, HYBRID_D_K, seed) for seed in a.seeds]
+        out["hybrid"] = [
+            point(a.arm, HYBRID_D_K, seed, full_attention_layers=(1,)) for seed in a.seeds
+        ]
+    out["seconds"] = time.perf_counter() - started
+
+    if summary_dir is not None:
+        path = Path(summary_dir) / f"extension_{which}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(out, indent=2, sort_keys=True))
+        out["path"] = str(path)
+    return out

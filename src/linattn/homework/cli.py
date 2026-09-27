@@ -1,17 +1,23 @@
 """Точки входа каркаса (scaffold) домашнего задания.
 
+    python -m linattn.homework.cli assign    --student NAME
     python -m linattn.homework.cli gate      [--device auto] [--out results/gate]
     python -m linattn.homework.cli time-run  [--device auto] [--arm linear] [--steps N]
-    python -m linattn.homework.cli budget    [--grid reduced] --seconds-per-run S
-    python -m linattn.homework.cli sweep     [--grid reduced] [--device auto]
-    python -m linattn.homework.cli plot      [--grid reduced] [--out figures]
+    python -m linattn.homework.cli budget    [--grid reduced | --student NAME] --seconds-per-run S
+    python -m linattn.homework.cli sweep     [--grid reduced | --student NAME] [--device auto]
+    python -m linattn.homework.cli extend    --student NAME --which {a,b,c,d} [--dry-run]
+    python -m linattn.homework.cli plot      [--grid reduced | --grid student] [--out figures]
+
+Студент работает с ``--student``: правило обновления и два seed выводятся из
+хеша имени (:func:`~linattn.homework.sweep.assign_student`).  Именованные сетки
+``reduced`` и ``full`` — для эталонного прогона преподавателя.
 
 Каждая точка входа принимает явный ``--seed`` и по умолчанию ставит ``--device``
 в ``auto`` (``cuda -> mps -> cpu``).  ``"cuda"`` по умолчанию было бы дефектом
 (инвариант I9).
 
-``sweep`` вызывает :func:`~linattn.homework.gate.require_gate`, прежде чем
-что-либо конструировать.  Нет флага, который пропускает проверку ``gate``.
+``sweep`` и ``extend`` вызывают :func:`~linattn.homework.gate.require_gate`,
+прежде чем что-либо конструировать.  Нет флага, который пропускает проверку ``gate``.
 
 Из исходного чекаута запускайте всё это с ``PYTHONPATH=src``.
 """
@@ -36,7 +42,17 @@ from .gate import (
     run_gate,
     sweep_config,
 )
-from .sweep import COLLAPSE_ACC, GRIDS, bisection_runs, run_grid
+from .sweep import (
+    COLLAPSE_ACC,
+    EXTENSIONS,
+    GRIDS,
+    assign_student,
+    bisection_runs,
+    extension_new_runs,
+    run_extension,
+    run_grid,
+    student_grid,
+)
 from .train import run_experiment
 
 
@@ -85,8 +101,30 @@ def cmd_gate(args) -> int:
     return 0 if passed else 1
 
 
+def _print_assignment(student: str) -> None:
+    a = assign_student(student)
+    grid = student_grid(student)
+    print(f"студент : {a.student}")
+    print(f"правило : {a.arm}")
+    print(f"seed    : {a.seeds[0]}, {a.seeds[1]}")
+    print(f"запусков: {grid.n_runs()} в сетке и {len(GATE_POINTS)} на проверку gate")
+
+
+def cmd_assign(args) -> int:
+    _print_assignment(args.student)
+    for which in EXTENSIONS:
+        n = extension_new_runs(which, assign_student(args.student))
+        print(f"расширение ({which}): запусков сверх сетки — {n}")
+    return 0
+
+
 def cmd_sweep(args) -> int:
-    grid = GRIDS[args.grid]
+    if args.student:
+        grid = student_grid(args.student)
+        _print_assignment(args.student)
+        print()
+    else:
+        grid = GRIDS[args.grid]
     try:
         records = require_gate(
             device=args.device, out_dir=args.gate_out, progress=not args.quiet, seed=args.seed
@@ -123,11 +161,12 @@ def cmd_budget(args) -> int:
     per_run = args.seconds_per_run
     print(f"Секунд на запуск: {per_run:.0f}  (измерьте командой `time-run` на своей машине)")
     print(f"{'сетка':<10}{'запусков':>9}{'x с/запуск':>12}{'= часов':>10}")
-    for name, grid in GRIDS.items():
-        if args.grid not in (None, name):
-            continue
+    grids = [student_grid(args.student)] if args.student else [
+        grid for name, grid in GRIDS.items() if args.grid in (None, name)
+    ]
+    for grid in grids:
         b = grid.budget(per_run)
-        print(f"{name:<10}{b['runs']:>9}{per_run:>12.0f}{b['hours_total']:>10.2f}")
+        print(f"{grid.name:<10}{b['runs']:>9}{per_run:>12.0f}{b['hours_total']:>10.2f}")
     print(
         f"\nОдна бисекция для M* стоит не более {bisection_runs(0, 1)} запусков при разрешении 1 "
         f"и {bisection_runs(0, 2)} при разрешении 2."
@@ -174,6 +213,43 @@ def cmd_time_run(args) -> int:
     return 0
 
 
+def cmd_extend(args) -> int:
+    a = assign_student(args.student)
+    n = extension_new_runs(args.which, a)
+    print(f"расширение ({args.which}), правило {a.arm}, seed {a.seeds[0]}, {a.seeds[1]}; "
+          f"запусков сверх сетки студента — {n}")
+    if args.dry_run:
+        if args.seconds_per_run is not None:
+            print(f"{n} запусков x {args.seconds_per_run:.0f} с/запуск = "
+                  f"{n * args.seconds_per_run / 3600:.1f} ч")
+        return 0
+    try:
+        require_gate(device=args.device, out_dir=args.gate_out, progress=not args.quiet)
+    except GateFailure as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    out = run_extension(
+        args.which, args.student, device=args.device, out_dir=args.out,
+        summary_dir=args.summary_dir, progress=not args.quiet, skip_gate=True,
+    )
+    for key in ("equal_state_bytes", "pure", "hybrid"):
+        for p in out.get(key, []):
+            m_star = p["m_star"] if p["m_star"] is not None else f"цензурирована ({p['censored']})"
+            print(f"  {key:<17} d_k={p['d_k']:<3} d_v={p['d_v']:<3} seed={p['seed']:<8} M*={m_star}")
+    if args.which in ("a", "b"):
+        try:
+            from .plotting import plot_negative_controls, plot_write_count_test
+        except ImportError:  # pragma: no cover - зависит от установки
+            plot_negative_controls = plot_write_count_test = None
+        if plot_negative_controls is not None:
+            Path(args.figures).mkdir(parents=True, exist_ok=True)
+            fig = Path(args.figures) / f"extension-{args.which}.png"
+            (plot_negative_controls if args.which == "a" else plot_write_count_test)(out, fig)
+            print(f"  рисунок: {fig}")
+    print(f"  сводка: {out.get('path')}")
+    return 0
+
+
 def cmd_plot(args) -> int:
     from .plotting import load_summary, plot_all
 
@@ -193,6 +269,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="linattn.homework.cli")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    p = sub.add_parser("assign", help="правило обновления и seed студента, выведенные из имени")
+    p.add_argument("--student", required=True, help="имя студента, как в ведомости")
+    p.set_defaults(func=cmd_assign)
+
     p = sub.add_parser("gate", help="запустить блокирующую контрольную проверку gate (инвариант I6)")
     _add_common(p)
     p.add_argument("--out", default="results/gate")
@@ -201,7 +281,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("sweep", help="запустить перебор (sweep) по ёмкости (отказывает, если проверка gate не пройдена)")
     _add_common(p)
-    p.add_argument("--grid", default="reduced", choices=sorted(GRIDS))
+    which = p.add_mutually_exclusive_group()
+    which.add_argument("--grid", default="reduced", choices=sorted(GRIDS))
+    which.add_argument("--student", default=None, help="сетка студента вместо именованной")
     p.add_argument("--out", default="results/runs")
     p.add_argument("--summary-dir", default="results")
     p.add_argument("--gate-out", default="results/gate")
@@ -214,9 +296,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_sweep)
 
     p = sub.add_parser("budget", help="запусков x секунд-на-запуск для каждой сетки")
-    p.add_argument("--grid", default=None, choices=sorted(GRIDS))
+    which = p.add_mutually_exclusive_group()
+    which.add_argument("--grid", default=None, choices=sorted(GRIDS))
+    which.add_argument("--student", default=None)
     p.add_argument("--seconds-per-run", type=float, required=True)
     p.set_defaults(func=cmd_budget)
+
+    p = sub.add_parser("extend", help="запуски одного расширения части 3 (отказывает без gate)")
+    _add_common(p)
+    p.add_argument("--student", required=True)
+    p.add_argument("--which", required=True, choices=EXTENSIONS)
+    p.add_argument("--out", default="results/runs")
+    p.add_argument("--summary-dir", default="results")
+    p.add_argument("--gate-out", default="results/gate")
+    p.add_argument("--figures", default="figures")
+    p.add_argument("--dry-run", action="store_true", help="напечатать число запусков и остановиться")
+    p.add_argument("--seconds-per-run", type=float, default=None)
+    p.set_defaults(func=cmd_extend)
 
     p = sub.add_parser("time-run", help="замерить один представительный запуск на этом устройстве")
     _add_common(p)
@@ -229,7 +325,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_time_run)
 
     p = sub.add_parser("plot", help="построить графики для отчёта по сводке сетки")
-    p.add_argument("--grid", default="reduced", choices=sorted(GRIDS))
+    p.add_argument("--grid", default="reduced", choices=sorted(GRIDS) + ["student"])
     p.add_argument("--summary-dir", default="results")
     p.add_argument("--out", default="figures")
     p.set_defaults(func=cmd_plot)

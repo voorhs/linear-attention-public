@@ -1,15 +1,18 @@
 # linattn
 
-Reference implementations of linear attention -- parallel, recurrent, chunkwise,
-and a Triton kernel -- for a 90+90 minute course unit.
+Библиотека учебного модуля про линейное внимание: параллельная, рекуррентная и
+чанковая формы, Triton-ядро и каркас домашнего задания (`linattn.homework`).
 
 ```bash
-pip install "linattn @ git+https://github.com/voorhs/linear-attention-public@v0.1.0"
+pip install "linattn[plot] @ git+https://github.com/voorhs/linear-attention-public@v0.2.0"
+python -m linattn.homework.cli assign --student ivanov
 ```
 
-The seminar notebook installs this automatically; you do not need to run the
-command by hand.
+Ноутбук семинара ставит пакет сам. Порядок работы над домашним заданием — в
+файле задания. Эталонные результаты публикуются в
+[релизах](https://github.com/voorhs/linear-attention-public/releases) после
+срока сдачи части 1.
 
-**This repository is generated.** It mirrors the package from the course
-repository and is never edited here -- an edit made here is lost on the next
-sync. Issues and fixes belong upstream.
+**Этот репозиторий генерируется** из репозитория курса и здесь не
+редактируется: правка, сделанная здесь, пропадёт при следующей синхронизации.
+Об ошибках сообщайте преподавателю.
