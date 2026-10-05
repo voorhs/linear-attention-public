@@ -4,7 +4,7 @@
 чанковая формы, Triton-ядро и каркас домашнего задания (`linattn.homework`).
 
 ```bash
-pip install "linattn[plot] @ git+https://github.com/voorhs/linear-attention-public@v0.2.0"
+pip install "linattn[plot] @ git+https://github.com/voorhs/linear-attention-public@v0.2.1"
 python -m linattn.homework.cli assign --student ivanov
 ```
 

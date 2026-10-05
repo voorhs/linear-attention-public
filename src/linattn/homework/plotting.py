@@ -17,7 +17,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from .sweep import COLLAPSE_ACC
+from .sweep import COLLAPSE_ACC, largest_m_for
 
 _ARM_ORDER = ("softmax", "linear", "gated", "delta")
 
@@ -133,27 +133,65 @@ def plot_write_count_test(summary: dict, path, title: Optional[str] = None) -> s
     a stored pair each: `M*(D) = M*(0) - D/2`.  The two ways to get it wrong are
     drawn as well -- no shift at all (the naive "capacity is independent of
     sequence length" reading) and a shift of `-D` (writes miscounted as pairs).
+
+    Censored capacities are open triangles at their search bounds, not measured
+    values.  Upper bounds depend on ``D``.  Prediction lines require a measured,
+    uncensored ``M*(0)``; no baseline is inferred from a censored point.
     """
     plt = _require_matplotlib()
     points = summary["write_count_test"]
     if not points:
         raise ValueError("this summary has no write-count panel")
     fig, ax = plt.subplots(figsize=(5.0, 3.6))
-    xs = [p["n_distractors"] for p in points]
-    ys = [p["m_star"] for p in points]
-    ax.scatter(xs, ys, s=26, color="C0", label="measured M*", zorder=3)
-    base = next((p["m_star"] for p in points if p["n_distractors"] == 0), None)
+    from .gate import SMALLEST_M
+
+    measured = [p for p in points if p["m_star"] is not None and not p["censored"]]
+    if measured:
+        ax.scatter(
+            [p["n_distractors"] for p in measured], [p["m_star"] for p in measured],
+            s=26, color="C0", label="measured M*", zorder=3,
+        )
+    for direction, marker, label in (
+        ("below", "v", "below search range"),
+        ("above", "^", "at/above search limit"),
+    ):
+        censored = [p for p in points if p["censored"] == direction]
+        if not censored:
+            continue
+        bounds = [
+            SMALLEST_M if direction == "below" else largest_m_for(p["n_distractors"])
+            for p in censored
+        ]
+        ax.scatter(
+            [p["n_distractors"] for p in censored], bounds, s=44, marker=marker,
+            facecolors="none", edgecolors="C0", label=label, zorder=3,
+        )
+        for p, bound in zip(censored, bounds):
+            ax.annotate(
+                f"M* {'<' if direction == 'below' else '>='} {bound}",
+                (p["n_distractors"], bound), xytext=(0, -12 if direction == "below" else 10),
+                textcoords="offset points", ha="center",
+                va="top" if direction == "below" else "bottom", fontsize=8,
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.85, "pad": 1},
+            )
+    base = next((p["m_star"] for p in measured if p["n_distractors"] == 0), None)
     if base is not None:
-        ds = sorted(set(xs))
+        ds = sorted({p["n_distractors"] for p in points})
         ax.plot(ds, [base for _ in ds], ls=":", color="0.5", label="no shift (wrong)")
         ax.plot(ds, [base - d / 2 for d in ds], ls="-", color="C1", label="predicted -D/2")
         ax.plot(ds, [base - d for d in ds], ls="--", color="0.5", label="-D (writes as pairs)")
+    else:
+        fig.text(
+            0.5, 0.02, "No measured M*(0): prediction lines omitted",
+            ha="center", va="bottom", fontsize=8,
+        )
+    ax.margins(x=0.12, y=0.18)
     ax.set_xlabel("D (written distractor tokens)")
     ax.set_ylabel("M*")
     ax.set_title(title or "Write-count test: W = 2M + D + Q")
     ax.grid(alpha=0.25)
     ax.legend(fontsize=8)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.08 if base is None else 0, 1, 1))
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return str(path)
